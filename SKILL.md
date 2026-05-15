@@ -1,0 +1,433 @@
+---
+name: rise-rich-protocol
+description: Use when integrating with the rise.rich protocol on Solana — querying markets, buying/selling, borrowing/repaying, unwinding positions, indexing events, launching new tokens, or reasoning about its floor-backed lending model. The canonical agent-facing reference for the protocol; covers both the public integration API (easy lane) and direct Anchor/IDL program calls (advanced lane).
+---
+
+# rise.rich Protocol
+
+## What rise.rich is, in one paragraph
+
+rise.rich is a **bonding-curve token launchpad with built-in floor-backed lending** on Solana. Every market has a token mint + a linear bonding curve + a monotonically rising floor price. Users can deposit tokens as collateral and borrow `mint_main` (SOL or USDC) against that collateral, valued at floor. Because the floor never decreases, `collateral_value ≥ debt` is invariant by construction — so the protocol has **no oracles and no liquidations**, ever. The "interest-free non-recourse borrowing" model falls out of this directly.
+
+## Mental model
+
+Three principles drive every decision:
+
+1. **The IDL is truth, not the docs.** The published `docs/PROGRAM.md` covers 8 of 22 instructions. The bundled IDL exposes the rest. When in doubt, derive account lists from the IDL.
+2. **Two programs, not one.** **Rise** (`RiseZSHaLdj7pfn1tisUoSdG2i3QcVz9sQKuaRG9rar`) is a thin orchestration wrapper that CPI's into **Mayflower** (`AVMmmRzwc2kETQNhPiFVnyu62HrgsQXTD6D7SnSfEz7v`). Mayflower is the real engine — bonding curves, collateral, debt accounting, the global `LogAccount`. Both programs have PDAs you'll touch.
+3. **Pick the easy lane unless you have a reason not to.** The integration API exposes most user-facing flows as one HTTP call returning a signed-ready VersionedTransaction. Drop to direct IDL only for things the API doesn't expose (notably atomic loops via `leverageBuy` / `leverageSell`) or when rate limits matter for your workload.
+
+## When to use this skill
+
+- Integrating a frontend, bot, or backend with rise.rich markets
+- Building trading interfaces, portfolio dashboards, or market scanners
+- Quoting buys/sells or computing borrow capacity
+- Borrowing against deposited collateral and unwinding positions
+- Launching a new token (`initMarket`) or wrapping creator-side operations
+- Indexing rise/Mayflower events
+- Reasoning about the protocol model for product/UX decisions
+
+## When NOT to use this skill
+
+- Generic Solana program design (framework choice, Token-2022 rules, IDL codegen) → use a Solana smart-contract dev skill
+- Auditing a non-rise program (Sealevel attack classes) → use a Solana security audit skill
+- Pure off-chain math without protocol coupling
+
+If your task touches user funds with chained transactions, audit the flow before shipping. Mayflower's `LogAccount` is a global mutable PDA, all accounts are caller-supplied, and Solana has no implicit safety — the eight Sealevel attack classes (signer / owner / data-matching / duplicate-mutable / reinit / revival / arbitrary-CPI / type-cosplay / PDA-sharing) all apply.
+
+---
+
+## Pick a lane: Integration API vs Direct program
+
+| Need | Lane | Why |
+|---|---|---|
+| List markets, get market data, OHLC, transaction history | **API** | Free, no SDK setup, server-computed fields like `delta_to_floor_percentage` |
+| One-shot buy or sell | **API** (`/program/buyToken`, `/program/sellToken`) | Returns signed-ready base64 VersionedTransaction; you only sign + send |
+| Atomic deposit+borrow or repay+withdraw | **API** (`/program/deposit-and-borrow`, `/program/repay-and-withdraw`) | Backend computes the delta (deposit needed for target borrow, repay needed to maintain LTV) |
+| Borrow capacity preview | **API** (`POST /markets/{addr}/borrow/quote`) | Returns `maxBorrowable`, `requiredDeposit`, `grossBorrow` for a desired net borrow |
+| Quote a trade (price, slippage, fees) | **API** (`POST /markets/{addr}/quote`) | Curve math server-side; the public SDK's local quote has a known sell-fee bug |
+| Portfolio summary / positions with P&L | **API** (`/users/{wallet}/portfolio/...`) | Indexed, pre-aggregated |
+| **Atomic loop (`leverageBuy` × N in one tx)** | **Direct** | API does NOT expose this. Required for auto-looper UX. |
+| **Atomic deleverage (`leverageSell`)** | **Direct** | Same reason. |
+| Token creation (`initMarket`) | **Direct** | Not in API; needs vanity-seed grind. |
+| Floor raise instructions, creator-fee withdrawal | **Direct** | Not in API. |
+| Indexing on-chain events with full payloads | **Direct** (RPC) | API gives transaction history but not raw event payloads. |
+
+**Default to API.** Drop to direct only when the table above says so.
+
+---
+
+## Lane 1: Integration API
+
+### Base URLs
+
+| Network | URL |
+|---|---|
+| Mainnet | `https://public.rise.rich` |
+| Devnet | `https://publicdev.rise.rich` |
+
+All requests need an `x-api-key: <YOUR_API_KEY>` header. Contact the rise team to get a key.
+
+### All 12 endpoints + rate limits
+
+| Endpoint | Req/min |
+|---|---|
+| `GET /markets` (filter, sort, paginate) | 40 |
+| `GET /markets/{addr}` | 55 |
+| `GET /markets/{addr}/transactions` | 60 |
+| `GET /markets/{addr}/ohlc/{1m\|5m\|1h\|1d}` | 20 |
+| `POST /markets/{addr}/quote` (`amount`, `direction: buy\|sell`) | 40 |
+| `POST /markets/{addr}/borrow/quote` (`wallet`, optional `amountToBorrow`) | 40 |
+| `POST /program/buyToken` (`wallet`, `market`, `cashIn`, `minTokenOut`) | 30 |
+| `POST /program/sellToken` (`wallet`, `market`, `tokenIn`, `minCashOut`) | 30 |
+| `POST /program/deposit-and-borrow` (`wallet`, `market`, `borrowAmount`) | 10 |
+| `POST /program/repay-and-withdraw` (`wallet`, `market`, `withdrawAmount`) | 10 |
+| `GET /users/{wallet}/portfolio/summary` | 60 |
+| `GET /users/{wallet}/portfolio/positions` | 60 |
+| **Global cap (all endpoints combined)** | **150** |
+
+`429` returns `{ ok: false, error }`. Repeated violations across separate minutes trigger progressive cooldowns: 1 min → 5 min → 20 min → 1 day after the 4th violation. **Back off on 429** to avoid the cooldown.
+
+### Address resolution
+
+Every endpoint accepts **either** the SPL token mint **or** the Rise market address. Whichever your caller has, pass it through.
+
+### Amounts
+
+Always **RAW units** (no decimals). SOL = 9 decimals (`0.1 SOL = 100_000_000`). USDC = 6 decimals (`1 USDC = 1_000_000`). Market tokens match `mint_main` decimals.
+
+### Canonical flow: Quote → Trade → Sign & Send → **check `meta.err`**
+
+```ts
+import { VersionedTransaction, Connection } from "@solana/web3.js";
+
+// 1. Quote
+const { quote } = await fetch(`${API}/markets/${market}/quote`, {
+  method: "POST",
+  headers: { "Content-Type": "application/json", "x-api-key": KEY },
+  body: JSON.stringify({ amount: 100_000_000, direction: "buy" }),
+}).then(r => r.json());
+
+// 2. Build tx (1% slippage)
+const minTokenOut = Math.floor(quote.amountOut * (1 - 0.01));
+const { transaction } = await fetch(`${API}/program/buyToken`, {
+  method: "POST",
+  headers: { "Content-Type": "application/json", "x-api-key": KEY },
+  body: JSON.stringify({ wallet: wallet.publicKey.toBase58(), market, cashIn: 100_000_000, minTokenOut }),
+}).then(r => r.json());
+
+// 3. Sign + send
+const tx = VersionedTransaction.deserialize(Buffer.from(transaction, "base64"));
+tx.sign([wallet]);
+const sig = await connection.sendRawTransaction(tx.serialize());
+await connection.confirmTransaction(sig, "confirmed");
+
+// 4. CRITICAL — check meta.err. Confirmed != succeeded.
+const result = await connection.getTransaction(sig, { maxSupportedTransactionVersion: 0, commitment: "confirmed" });
+if (result?.meta?.err) {
+  // Common: { Custom: 6041 } = SlippageExceeded. Tx landed and consumed fees, but reverted.
+  throw new Error(`tx ${sig} landed but reverted: ${JSON.stringify(result.meta.err)}`);
+}
+```
+
+### Borrow capacity preview
+
+```ts
+POST /markets/{addr}/borrow/quote
+body: { wallet, amountToBorrow?: number }
+```
+Returns:
+```
+{
+  depositedTokens, walletBalance, debt,
+  maxBorrowable, maxBorrowableIfDepositAll, maxBorrowableUsd, maxBorrowableIfDepositAllUsd,
+  floorPrice, borrowFeePercent,
+  requiredDeposit?, grossBorrow?    // only set when amountToBorrow is provided
+}
+```
+
+### Unwind recipe (without atomic `leverageSell`)
+
+Two calls. Both rate-limited to 10/min — fine for unwinds.
+
+```ts
+// 1. Repay debt + pull collateral out of position (single atomic tx)
+POST /program/repay-and-withdraw  body: { wallet, market, withdrawAmount }
+// → { transaction, repayAmount, withdrawAmount, includedRepay }
+
+// 2. Sell the freed tokens back to the curve
+POST /program/sellToken           body: { wallet, market, tokenIn, minCashOut }
+```
+
+For **atomic** deleverage in a single tx, use Lane 2's `leverageSell` IDL call. The API does not expose it.
+
+### Market list filtering (`GET /markets`)
+
+Sortable by: `created` (default), `marketcap`, `volume24h`, `holders`, `floor`, `price`, `variation`, `near_floor`, `liquidity`. Filterable by: `is_verified`, `creator_fee_min/max`, `mcap_min/max`, `vol24h_min/max`, `locked_min/max`, `created_period: today|yesterday|week|month`. Responses cached server-side for 10s per unique param combination.
+
+Computed fields added per row:
+- `delta_to_floor_percentage` — `((price − floor) / floor) × 100`
+- `locked_supply_percentage` — `(mayflower_total_collateral / mayflower_token_supply) × 100`
+
+---
+
+## Lane 2: Direct program integration
+
+### Lane choice (compatibility — this is locked)
+
+**Use `@solana/web3.js@^1.x` + `@coral-xyz/anchor@^0.29`.** The published rise SDK pins these. `@solana/kit` (web3.js v2) is a migration — you'd bypass the SDK and regenerate clients via Codama. Don't mix the two; their `TransactionInstruction` vs `IInstruction` types are incompatible.
+
+### Constants
+
+```
+RISE_PROGRAM_ID         = "RiseZSHaLdj7pfn1tisUoSdG2i3QcVz9sQKuaRG9rar"
+MAYFLOWER_PROGRAM_ID    = "AVMmmRzwc2kETQNhPiFVnyu62HrgsQXTD6D7SnSfEz7v"
+RISE_TENANT (mainnet)   = "5scY2JGWLnBubCMbWrn1gi8FQEP8SPjvQ1hfjW4ktYUb"
+RISE_TENANT_SEED        = "Eg4Akr8HRv3gy4MaSp3zgKgC5qnN1V5ZTqAjhT54xJ9L"
+MAYFLOWER_TENANT        = "HeBDu9g5EN6qdDJWijHHpxYuMBE6aWvy1BmzFyEa7Q7C"
+TEAM_WALLET             = "7p9Wd66uwCdZdAm7EPMooXdghSB9yG4iKpT69ipmms8D"
+TOKEN_METADATA_PROGRAM  = "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s"
+USDC_MAINNET            = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+NATIVE_MINT (WSOL)      = "So11111111111111111111111111111111111111112"
+
+API_BASE_MAINNET        = "https://public.rise.rich"
+API_BASE_DEVNET         = "https://publicdev.rise.rich"
+
+// Devnet:
+RISE_DEVNET             = "7gDn1L2Bmg53royeUgvZtWujfvxS9TmpchtBToP9zDhB"
+MAYFLOWER_DEVNET        = "MD2pPJCjpUT5ttJFUVeP2Xka1ZSvCJMZUoX4XTdPdet"
+```
+
+### PDAs you must derive
+
+**Rise:**
+
+| PDA | Seeds |
+|---|---|
+| Tenant | `["tenant", seed_pubkey]` |
+| Market | `["market", rise_tenant, market_meta]` |
+| PersonalAccount | `["personal_account", market, owner]` |
+| CashEscrow | `["cash_escrow", rise_market]` |
+| CreatorEscrow | `["creator_escrow", rise_market]` |
+| TeamEscrow | `["team_escrow", mint_main]` ← **per `mint_main`, NOT per market** |
+| TeamConfig | `["team_config"]` (global) |
+| MintToken | `[vanity_seed.to_le_bytes()]` — must hash to address ending in "rise" |
+
+**Mayflower:**
+
+| PDA | Seeds |
+|---|---|
+| Tenant | `["tenant", seed_address]` |
+| MarketGroup | `["market_group", seed_address]` |
+| Market | `["market", seed_address]` |
+| MarketMeta | `["market_meta", seed_address]` |
+| MintOptions | `["mint_options", market_meta_address]` |
+| MarketLinear | `["market_linear", market_meta_address]` |
+| LiqVaultMain | `["liq_vault_main", market_meta_address]` |
+| RevEscrowGroup | `["rev_escrow_group", market_meta_address]` |
+| RevEscrowTenant | `["rev_escrow_tenant", market_meta_address]` |
+| **PersonalPosition** | `["personal_position", market_meta_address, owner]` |
+| **PersonalPositionEscrow** | `["personal_position_escrow", personal_position_address]` |
+| LogAccount | `["log"]` ← **global, mut on every Mayflower op** |
+
+`@rise-rich/skill-helpers` exports a `PDA` module for all of these — prefer the helper over hand-rolling seeds.
+
+### The 22 Rise instructions
+
+The IDL exposes exactly 22 instructions. Listed below in **thematic grouping** for skim-reading — **this is NOT the IDL discriminator order** (the IDL orders them differently; e.g. `buyWithExactCashIn` is #6 and `leverageBuy` is #19 in the IDL, not #7 and #13). For dispatch / discriminator computation, always read the IDL's `instructions[]` array in order — never use these numbers as positions.
+
+```
+admin / setup           trading & lending          loop primitives & admin ops
+─────────────────       ─────────────────────      ──────────────────────────
+version                 buyWithExactCashIn         leverageBuy        ← single-tx loop
+initTenant              sellWithExactTokenIn       leverageSell       ← single-tx deleverage
+initMarketGroup         deposit                    raiseFloorPreserveArea
+initMarket              withdraw                   raiseFloorExcessLiquidity
+initPersonalAccount     borrow                     withdrawCreatorFees
+initTeamEscrow          repay                      withdrawTeamFees
+                                                   updateTeamWallet
+                                                   updateTenantAdmin
+                                                   revDistribute
+                                                   updateMarket
+```
+
+The published SDK wraps `buy` and `sell`. The other 20 are direct IDL calls — derive account lists from the bundled IDL (`@riserich/sdk/dist/idl/rise.json`) or read the inline `# Accounts` docs there. Each IDL instruction has account-by-account doc comments explaining its role.
+
+### Account-list patterns by instruction
+
+**Anchor event-CPI trailer.** All Rise instructions emit events via Anchor's `event_cpi` macro, which appends two trailing accounts to every event-emitting instruction: `eventAuthority` (PDA `["__event_authority"]` under the program) and `program` (the program ID itself, used as a sentinel). When you build instructions through Anchor's `program.methods.X().accounts({...})` builder, these trailers are filled automatically — you don't pass them. But the IDL counts them, and if you're constructing raw `TransactionInstruction`s by hand you **must** include them. The counts below are **IDL-true** (functional accounts **plus** event-CPI trailers).
+
+Single-ix operations follow consistent account-list patterns once you know them:
+
+- **`buyWithExactCashIn`** — **24 accounts** (22 functional + 2 event-CPI): buyer (signer), tenant, market, cashEscrow, mayTenant, mayMarketGroup, marketMeta, mayMarket, tenantSeed, mintToken, mintMain, tokenDst, mainSrc, liqVaultMain, revEscrowGroup, revEscrowTenant, tokenProgramMain, tokenProgram, mayflowerProgram, mayLogAccount, creatorEscrow, teamEscrow, **eventAuthority**, **program**. Args: `cashIn`, `minTokenOut`, `newShoulderEnd` (0 to skip floor raise), `floorIncreaseRatio`.
+- **`sellWithExactTokenIn`** — **23 accounts** (mirror of buy minus `tenantSeed`, plus event-CPI trailers). `tokenSrc` / `mainDst` swap roles vs buy. Seller is the signer.
+- **`deposit`** / **`withdraw`** — **14 accounts each** (12 functional + 2 event-CPI): owner (signer), personalAccount, market, marketMeta, mayMarket, corePersonalPosition, mayEscrow, mintToken, tokenSrc-or-tokenDst, tokenProgram, mayflowerProgram, mayLogAccount, **eventAuthority**, **program**. Arg: `amount`.
+- **`borrow`** — **22 accounts** (20 functional + 2 event-CPI): owner (signer), tenant, market, cashEscrow, personalAccount, mayTenant, mayMarketGroup, marketMeta, liqVaultMain, revEscrowGroup, revEscrowTenant, mayMarket, mintMain, corePersonalPosition, mainDst, tokenProgramMain, mayLogAccount, mayflowerProgram, creatorEscrow, teamEscrow, **eventAuthority**, **program**. Arg: `amount` (gross — user receives `amount × (1 − borrowFee)`).
+- **`repay`** — **12 accounts** (10 functional + 2 event-CPI; permissionless — `repayer` need not be the debtor): repayer (signer), marketMeta, mayMarket, corePersonalPosition, mintMain, mainSrc, liqVaultMain, tokenProgramMain, mayflowerProgram, mayLogAccount, **eventAuthority**, **program**. Arg: `amount`.
+- **`leverageBuy`** / **`leverageSell`** — see "Loop primitives" section below.
+
+The IDL's per-account docstrings (in `# Accounts` sections of each instruction) are the ground truth. Read them.
+
+### Personal-position layout (Mayflower)
+
+```rust
+PersonalPosition {
+    market_meta: Pubkey,
+    owner: Pubkey,
+    escrow: Pubkey,                  // per-position SPL vault for collateral
+    deposited_token_balance: u64,    // collateral
+    debt: u64,                       // outstanding mint_main debt (GROSS principal)
+}
+```
+
+### `initPersonalAccount` — does NOT lazy-init
+
+Fresh wallets return `AccountNotFound` on sim. **Prepend `initPersonalAccount`** on the first interaction per `(market, owner)` for any of `deposit`/`borrow`/`leverageBuy`. Idempotent after that.
+
+### Loop primitives (informational — no working code in this skill)
+
+The Rise IDL exposes two single-instruction loop primitives:
+
+```
+leverageBuy(exactCashIn: u64, increaseDebtBy: u64, minIncreaseCollateralBy: u64)
+leverageSell(...)
+```
+
+`leverageBuy` atomically: takes user `exactCashIn` + protocol-borrowed `increaseDebtBy`, buys tokens along the curve, deposits them as collateral, increments user debt. `leverageSell` mirrors it.
+
+**Building a robust multi-loop on top of `leverageBuy` is non-trivial.** You're managing:
+
+- CU budgeting (production measurement, 2026-05: a single `leverageBuy` is ~190k warm / ~220k cold CU on USDC mainnet; per-tx ceiling is 1.4M — so ~3 stacked iters per tx max. Benchmark your target market before locking the chunking strategy; numbers drift with Anchor / Solana / Rise program upgrades.)
+- Multi-tx chunking with state re-fetch and slippage re-plan between chunks
+- "Auto / Max" convergence math (the geometric series of cash → borrow → cash → borrow with safe LTV cap)
+- Priority-fee floor (Helius p50 vs recent-slot p75 vs configured floor)
+- Retry on blockhash expiry with re-plan, not blind resend
+- Resume reconciliation when chunk N lands but chunk N+1 hasn't
+- SOL-market WSOL wrap setup ixs on cold path (3 ixs) vs USDC-market setup (1 ix)
+
+**This skill intentionally does not include working code for the above.** The IDL exposes the primitive; teams building products on rise.rich (auto-loopers, leverage UIs, structured products) treat the orchestration layer as their differentiator. If you need to build one, read the IDL, plan the chunker carefully, and validate predicted-vs-on-chain state against `personal_position.deposited_token_balance` + `personal_position.debt` at every chunk boundary.
+
+### Quote math (off-chain, for previews without an API call)
+
+Linear bonding curve, three regions:
+
+```
+x ≤ x1:   p(x) = floor              (floor region)
+x ≤ x2:   p(x) = m1·x + b1          (shoulder region)
+x  > x2:  p(x) = m2·x + b2          (main region)
+
+b1 = (m2 − m1)·x2 + b2
+x1 = (floor − b1) / m1
+```
+
+Buy quote: `effectiveCashHuman = amountHuman · (1 − feeRate)`, then binary-search the curve integral.
+
+**Known SDK bug**: the bundled `@riserich/sdk` sell quote uses `market.buyFee` instead of `sellFee`. Use the API's `POST /markets/{addr}/quote` endpoint, or use `@rise-rich/skill-helpers`' `quoteSellLocal()` which fixes the fee.
+
+### Max-borrow formula
+
+```
+maxBorrowable_net = (deposited_tokens × floor_price − current_debt) × (1 − borrowFee)
+grossBorrow       = the on-chain `amount` argument
+netReceived       = grossBorrow × (1 − borrowFee)
+```
+
+The 3% origination fee is **not hardcoded** on-chain. It's `Gov.borrowFeeMicroBasisPoints` on the Rise `Market`, parameterized as a `GlobalBallotItem` with `{value, min, max, stepMicroBasisPoints}`. Today the value is fixed by the launch params — voting fields are reserved for future use and no current Rise instruction tallies votes — but the structure is in place. Since the field exists and will be governance-mutable, **read live** via `MarketData.borrowFee` or the API's `borrowFeePercent`; don't hardcode 3%.
+
+---
+
+## Critical gotchas (the ones that bite)
+
+1. **`Custom: 6041 SlippageExceeded` can land but revert silently.** A confirmed tx with `meta.err = { Custom: 6041 }` is finalized but failed. **Always check `meta.err` after `confirmTransaction`** — don't trust signature confirmation alone. This is the #1 source of "wait, my tx succeeded but nothing happened" bugs. Use `confirmAndCheckErr()` from `@rise-rich/skill-helpers`.
+
+2. **Mint must end with `"rise"` (case-insensitive).** `initMarket` errors `6008 InvalidMintTokenAddress` otherwise. Requires off-chain vanity-grind on `vanity_seed` (~2¹⁹ tries expected, seconds on CPU).
+
+3. **Token decimals must match `mint_main` decimals.** USDC markets → 6-decimal tokens. SOL markets → 9-decimal tokens. Mismatch returns `6009 InvalidMintDecimals`.
+
+4. **Freeze authority must be `None`.** Mayflower errors `6010 TokenFreezeAuthorityNotNone` otherwise. Don't confuse with Rise's separate error `6010 InvalidMintAuthority`, which is a mint-authority check on a different code path — same number, different program, different meaning.
+
+5. **Token metadata is admin-mutable, creator-immutable.** The tenant admin (currently the rise.rich team) can update metadata via `updateMarket` (CPI to Metaplex `update_metadata_account_v2`). The creator cannot. Warn users before `initMarket`: once minted, **you** cannot fix the name / ticker / logo — only the rise team can. For practical purposes treat metadata as locked for your project. The docs site currently says "immutable"; the IDL exposes `updateMarket` with the admin path — **IDL is truth**.
+
+6. **`teamEscrow` is per-`mint_main`, NOT per-market.** All USDC-collateral markets share one `teamEscrow`; same for SOL. Hand-deriving with `["team_escrow", market_address]` instead of `["team_escrow", mint_main]` silently uses the wrong escrow.
+
+7. **`mayLogAccount` is a global mut PDA.** Single-account write contention is theoretical at low TPS but caps per-block throughput at scale. Flag for high-frequency designs.
+
+8. **`personal_account` does NOT lazy-init.** Prepend `initPersonalAccount` on first interaction per `(market, owner)`. Idempotent after.
+
+9. **Token-2022 supported (not assumed by default).** Use `token_interface::*` + `transfer_checked` on the program side; on the client, validate per-mint via the mint account's `owner` field — don't trust caller-supplied `token_program`. Both legacy SPL Token and Token-2022 are supported by the IDL; the docs confirm support but don't claim Token-2022 is the default. Check each mint's `owner` before picking which token program to pass.
+
+10. **`disableSell: bool` in `initMarket` is a PERMANENT kill switch.** Set `false` unless you genuinely want a no-sell token. No way to flip later.
+
+11. **`MarketPermissions: u16` is a bitfield of admin kill-switches.** Tenant admin can disable buys/sells/borrows/etc per market (errors `6052..6060`). Reflect this in UX disclaimers — admin retains kill power.
+
+12. **Floor is monotonic but stair-stepped, not continuous.** Initial phase: raises immediately on liquidity. After $100k cumulative net inflows: 30s cooldown. Cooldown grows with cumulative inflows, capped at 120s. Sells burn supply → tightens reserves-per-token ratio → next ratchet comes faster, so floor **can grow during downturns**.
+
+13. **Cross-tx slippage drift.** Slippage is static within a tx (sim covers atomicity) but dynamic between chained txs. **Re-fetch on-chain state and re-plan** between chunks; don't carry stale quotes.
+
+14. **SDK quirks worth knowing.** Public `@riserich/sdk` has no shipped tests or examples. Sell quote uses buy fee (bug above). `leverageBuy` / `leverageSell` are missing from `docs/PROGRAM.md` but exist in the IDL with full account lists and inline docs. **The IDL is truth.**
+
+---
+
+## Test → ship path
+
+1. **Devnet** (`https://publicdev.rise.rich` + devnet program IDs) — full integration test against the devnet deployment, free SOL/USDC from devnet faucets.
+2. **Mainnet smoke** — single-purpose keypair, small dollar cap (e.g. $5–$20) until hardened. Verify:
+   - Predicted vs on-chain `deposited_token_balance` and `debt` match exactly (they will, to the lamport — the math is closed-form).
+   - `meta.err` is null after confirmation.
+   - CU consumption matches your budget (use `unitsConsumed` from `meta`).
+3. **Public ship.**
+
+---
+
+## What `@rise-rich/skill-helpers` provides (and doesn't)
+
+**Provides** (see `packages/rise-skill-helpers/src/`):
+
+- `PDA.*` — every Rise + Mayflower PDA listed above, derived correctly
+- `RiseApi` — typed HTTP client for all 12 endpoints with 429-aware exponential backoff
+- `confirmAndCheckErr(sig, conn)` — `confirmTransaction` + `meta.err` check in one call
+- `quoteSellLocal(market, tokenIn)` — fixed local sell quote (works around SDK fee bug)
+- `Constants.*` — program IDs, tenant addresses, USDC mints, WSOL mint
+
+**Does NOT provide:**
+
+- `leverageBuy` / `leverageSell` ix builders
+- Multi-loop chunker / planner
+- Convergence math, retry-on-expiry, priority-fee floor logic
+- Indexer (write your own; the per-event payload shape is in `rise-docs/INDEXING.md`)
+
+The omissions are deliberate — see README "What's NOT inside (and why)".
+
+---
+
+## Resources
+
+| Resource | Where |
+|---|---|
+| Docs hub | https://docs.rise.rich |
+| Website | https://www.rise.rich/ |
+| Twitter / X | https://x.com/risedotrich |
+| API base (mainnet) | `https://public.rise.rich` |
+| API base (devnet) | `https://publicdev.rise.rich` |
+| Rise IDL | bundled in `@riserich/sdk` JSON |
+| Audit | Sherlock (see x.com/sherlockdefi/status/2023440979601367514) |
+| This skill (issues/PRs) | https://github.com/CHARLES-PONZI/rise-rich-skill |
+
+## Quirks summary cheat-sheet
+
+```
+Mint suffix         "rise" (case-insensitive)         vanity-grind
+Token decimals       == mint_main decimals             6 (USDC) or 9 (SOL)
+Freeze authority     None                              else 6010
+LogAccount           global, mut every Mayflower op    throughput bottleneck
+TeamEscrow seed      ["team_escrow", mint_main]        NOT per-market
+PersonalAccount      not lazy-init                     prepend initPersonalAccount
+SDK sell quote       uses buy fee (bug)                use API or skill-helpers
+Slippage 6041        confirmed-but-reverted            check meta.err
+disableSell          permanent kill switch             set false unless intentional
+Borrow fee           Gov ballot item (voting reserved) read live, don't hardcode 3%
+Floor                monotonic stair-step              never drops → no liquidations
+Lane choice          web3.js v1 + anchor 0.29          kit/v2 needs Codama regen
+leverageBuy CU       ~190k warm / ~220k cold           ≤ 3 per tx safely
+Cross-tx slippage    static in-tx, dynamic cross-tx    re-fetch state between chunks
+```

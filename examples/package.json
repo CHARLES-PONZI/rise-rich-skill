@@ -1,0 +1,16 @@
+{
+  "name": "rise-rich-skill-examples",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Reference examples for @rise-rich/skill-helpers",
+  "license": "MIT",
+  "dependencies": {
+    "@rise-rich/skill-helpers": "file:../packages/rise-skill-helpers",
+    "@solana/web3.js": "^1.95.0"
+  },
+  "devDependencies": {
+    "ts-node": "^10.9.0",
+    "typescript": "^5.3.0",
+    "@types/node": "^20.0.0"
+  }
+}
