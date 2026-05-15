@@ -71,7 +71,10 @@ export function quoteSellLocal(market: SellQuoteMarket, tokenInHuman: number): S
 
   const { floor, m1, m2, x2, b2, supplyHuman, sellFee } = market;
   const b1 = (m2 - m1) * x2 + b2;
-  const x1 = m1 === 0 ? 0 : (floor - b1) / m1;
+  // Zero-slope shoulder: with m1 = 0 the floor region extends to x = x2 (since the
+  // shoulder line p(x) = b1 is constant). Matches upstream SDK's near-zero handling
+  // where x1 is effectively unreachable via division-by-zero.
+  const x1 = m1 === 0 ? x2 : (floor - b1) / m1;
 
   const sStart = supplyHuman;
   const sEnd = supplyHuman - tokenInHuman;
@@ -84,7 +87,8 @@ export function quoteSellLocal(market: SellQuoteMarket, tokenInHuman: number): S
 
   const fee = gross * sellFee;
   const amountOutHuman = gross - fee;
-  const averageFillPrice = gross / tokenInHuman;
+  // Post-fee average price (matches upstream SDK metric: cash actually received / tokens sold).
+  const averageFillPrice = amountOutHuman / tokenInHuman;
   const priceImpact = currentPrice === 0 ? 0 : (currentPrice - newPrice) / currentPrice;
 
   return {

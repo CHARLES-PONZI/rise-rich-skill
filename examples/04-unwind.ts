@@ -36,16 +36,17 @@ async function signAndSend(
 }
 
 async function main() {
-  const apiKey = process.env.RISE_API_KEY!;
-  const rpcUrl = process.env.RPC_URL!;
-  const walletPath = process.env.WALLET_PATH!;
-  const market = process.env.MARKET!;
-  const withdrawAmount = BigInt(process.env.WITHDRAW_AMOUNT!);
+  const apiKey = process.env.RISE_API_KEY;
+  const rpcUrl = process.env.RPC_URL;
+  const walletPath = process.env.WALLET_PATH;
+  const market = process.env.MARKET;
+  const withdrawAmountRaw = process.env.WITHDRAW_AMOUNT;
   const slippageBps = Number(process.env.SLIPPAGE_BPS ?? "300"); // 3% — unwinds can move price
 
-  if (!apiKey || !rpcUrl || !walletPath || !market || !withdrawAmount) {
+  if (!apiKey || !rpcUrl || !walletPath || !market || !withdrawAmountRaw) {
     throw new Error("set RISE_API_KEY, RPC_URL, WALLET_PATH, MARKET, WITHDRAW_AMOUNT");
   }
+  const withdrawAmount = BigInt(withdrawAmountRaw);
 
   const wallet = Keypair.fromSecretKey(
     Uint8Array.from(JSON.parse(fs.readFileSync(walletPath, "utf8"))),
@@ -67,11 +68,13 @@ async function main() {
   const { quote } = await api.quoteTrade(market, { amount: withdrawAmount, direction: "sell" });
   console.log(`  sell quote: ${quote.amountInHuman} tokens -> ${quote.amountOutHuman} ${quote.priceImpact >= 0 ? "(impact " + (quote.priceImpact * 100).toFixed(2) + "%)" : ""}`);
 
-  const minCashOut = Math.floor(Number(quote.amountOut) * (1 - slippageBps / 10_000));
+  // BigInt math preserves precision for raw amounts above Number.MAX_SAFE_INTEGER.
+  const amountOut = BigInt(quote.amountOut);
+  const minCashOut = (amountOut * BigInt(10_000 - slippageBps)) / 10_000n;
   const step2 = await api.sell(market, {
     wallet: wallet.publicKey.toBase58(),
     tokenIn: withdrawAmount,
-    minCashOut: BigInt(minCashOut),
+    minCashOut,
   });
   await signAndSend(connection, wallet, step2.transaction, "step2");
 

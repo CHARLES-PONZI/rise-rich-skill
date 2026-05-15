@@ -8,7 +8,7 @@ Drop this into any agent project — Claude Code, **OpenAI Codex CLI**, Cursor, 
 - Quote and execute buys / sells with proper slippage handling
 - Borrow against deposited collateral (atomic deposit+borrow) and unwind cleanly (atomic repay+withdraw → sell)
 - Derive the right Rise and Mayflower PDAs for direct-IDL work
-- Avoid the 14 production traps the docs don't warn about (silent `6041 SlippageExceeded`, immutable metadata, `teamEscrow` per-`mint_main`, etc.)
+- Avoid the 14 production traps the docs don't warn about (silent `6041 SlippageExceeded`, creator-immutable/admin-mutable metadata, `teamEscrow` per-`mint_main`, etc.)
 - Reason about the two-program (Rise + Mayflower) architecture and the floor-backed lending invariant that eliminates oracles and liquidations
 
 **Unaffiliated, public good, MIT licensed.** Not endorsed by the rise.rich team.

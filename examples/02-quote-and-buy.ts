@@ -42,12 +42,14 @@ async function main() {
   console.log(`  price impact: ${(quote.priceImpact * 100).toFixed(3)}%`);
   console.log(`  fee: $${quote.feeAmountUsd.toFixed(4)} (${(quote.feeRate * 100).toFixed(2)}%)`);
 
-  // 2. Build tx with slippage cushion
-  const minTokenOut = Math.floor(Number(quote.amountOut) * (1 - slippageBps / 10_000));
+  // 2. Build tx with slippage cushion.
+  // BigInt math preserves precision for raw amounts above Number.MAX_SAFE_INTEGER (2^53-1).
+  const amountOut = BigInt(quote.amountOut);
+  const minTokenOut = (amountOut * BigInt(10_000 - slippageBps)) / 10_000n;
   const { transaction } = await api.buy(market, {
     wallet: wallet.publicKey.toBase58(),
     cashIn,
-    minTokenOut: BigInt(minTokenOut),
+    minTokenOut,
   });
 
   // 3. Sign + send
