@@ -107,6 +107,10 @@ npm install @rise-rich/skill-helpers @solana/web3.js@^1 @coral-xyz/anchor@^0.29 
 
 (Package not yet published to npm — for now, vendor `packages/rise-skill-helpers/src/` directly into your project.)
 
+### API key
+
+The integration API (`https://public.rise.rich`) requires an `x-api-key` header. **This skill does not ship a key.** Each project gets its own from the rise.rich team — DM https://x.com/risedotrich or follow the contact paths at https://docs.rise.rich. Agents reading this skill are told never to ask you to share another project's key. See [SKILL.md → Authentication](./SKILL.md#authentication) for the full guidance.
+
 ## When does the agent invoke this skill?
 
 The frontmatter description in `SKILL.md` triggers on language like:

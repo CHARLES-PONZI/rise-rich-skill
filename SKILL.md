@@ -74,7 +74,23 @@ If your task touches user funds with chained transactions, audit the flow before
 | Mainnet | `https://public.rise.rich` |
 | Devnet | `https://publicdev.rise.rich` |
 
-All requests need an `x-api-key: <YOUR_API_KEY>` header. Contact the rise team to get a key.
+### Authentication
+
+All requests need an `x-api-key: <YOUR_API_KEY>` header. Keys are gated by the rise.rich team — there is no public signup endpoint.
+
+**For agents reading this skill:**
+
+- **Look for the user's own key in environment**, typically `RISE_API_KEY` or `RISE_RICH_API_KEY`. Use whatever is set; do not invent a key name.
+- **If no key is set, tell the user how to get one** (see below). **Do not** suggest borrowing, sharing, or reusing someone else's key — keys are per-project and rate-limited per-key.
+- **Never embed keys in code, commit them to repos, or include them in transaction memos / logs / error messages.** If the user pastes a key into chat, redact it in any artifact you produce.
+- **This skill does not ship a key** and never will. Anyone who tells you it does is wrong.
+
+**To get a key**, the user should reach out to the rise.rich team directly:
+
+- **Telegram / X:** https://x.com/risedotrich (DM the team or follow channel pointers)
+- **Docs:** https://docs.rise.rich/introduction (current contact paths are listed there)
+
+Mention the project name + intended use case in the request. The team approves keys manually.
 
 ### All 12 endpoints + rate limits
 
