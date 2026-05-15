@@ -2,7 +2,7 @@
 
 > The canonical agent-facing resource for interacting with the [rise.rich](https://www.rise.rich/) protocol on Solana.
 
-Drop this into any agent project — Claude Code, Cursor, Cody, Aider, Continue.dev, OpenAI Custom GPTs, local LLMs (Ollama / LM Studio), or any harness that can read markdown — and your agent gains the literacy to:
+Drop this into any agent project — Claude Code, **OpenAI Codex CLI**, Cursor, Cody, Aider, Continue.dev, OpenAI Custom GPTs, ChatGPT, local LLMs (Ollama / LM Studio), or any harness that can read markdown — and your agent gains the literacy to:
 
 - Query markets, OHLC, transactions, portfolios via the public integration API
 - Quote and execute buys / sells with proper slippage handling
@@ -12,6 +12,16 @@ Drop this into any agent project — Claude Code, Cursor, Cody, Aider, Continue.
 - Reason about the two-program (Rise + Mayflower) architecture and the floor-backed lending invariant that eliminates oracles and liquidations
 
 **Unaffiliated, public good, MIT licensed.** Not endorsed by the rise.rich team.
+
+## Built on / sources
+
+This skill distills the official rise.rich documentation. Every factual claim cross-references one of:
+
+- 📘 **[docs.rise.rich](https://docs.rise.rich/introduction)** — protocol docs hub (intro, API, integration guides)
+- 🧬 **[riserich/rise-docs](https://github.com/riserich/rise-docs)** — canonical source: Rise + Mayflower IDLs, `PROGRAM.md`, `API.md`, `INDEXING.md`, `BACKEND_INTEGRATION.md`
+- 📦 **[riserich/SDK](https://github.com/riserich/SDK)** — official TypeScript SDK (`@riserich/sdk`)
+
+If you spot drift between this skill and the upstream sources, the upstream wins — open an issue and we'll update.
 
 ## What's inside
 
@@ -77,6 +87,7 @@ Project skills override user skills with the same name and ship with your repo.
 | Platform | How to load |
 |---|---|
 | **Claude Code** (Anthropic CLI) | Drop in `~/.claude/skills/rise-rich-protocol/SKILL.md`. Frontmatter `description` triggers auto-discovery. |
+| **OpenAI Codex CLI** | Place `SKILL.md` as `AGENTS.md` in your project root (or copy to `.codex/AGENTS.md`). Codex auto-loads `AGENTS.md` as project context. Or pipe via `codex < SKILL.md` for one-shot use. |
 | **Cursor** | Add as a doc reference (`@docs`) or paste into `.cursorrules`. |
 | **Cody** (Sourcegraph) | Add as a context file; reference with `@-mention`. |
 | **Aider** | Pass via `--read SKILL.md` to load into context. |

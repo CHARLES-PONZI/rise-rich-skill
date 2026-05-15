@@ -5,6 +5,14 @@ description: Use when integrating with the rise.rich protocol on Solana — quer
 
 # rise.rich Protocol
 
+## Sources
+
+This skill is distilled from the official rise.rich sources. When facts in this skill disagree with these sources, the sources win:
+
+- **Protocol docs:** https://docs.rise.rich/introduction
+- **Canonical repo (IDLs, PROGRAM.md, API.md, INDEXING.md):** https://github.com/riserich/rise-docs
+- **Official SDK:** https://github.com/riserich/SDK (`@riserich/sdk`)
+
 ## What rise.rich is, in one paragraph
 
 rise.rich is a **bonding-curve token launchpad with built-in floor-backed lending** on Solana. Every market has a token mint + a linear bonding curve + a monotonically rising floor price. Users can deposit tokens as collateral and borrow `mint_main` (SOL or USDC) against that collateral, valued at floor. Because the floor never decreases, `collateral_value ≥ debt` is invariant by construction — so the protocol has **no oracles and no liquidations**, ever. The "interest-free non-recourse borrowing" model falls out of this directly.
