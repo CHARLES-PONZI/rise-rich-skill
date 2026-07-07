@@ -8,7 +8,8 @@ Drop this into any agent project — Claude Code, **OpenAI Codex CLI**, Cursor, 
 - Quote and execute buys / sells with proper slippage handling
 - Borrow against deposited collateral (atomic deposit+borrow) and unwind cleanly (atomic repay+withdraw → sell)
 - Derive the right Rise and Mayflower PDAs for direct-IDL work
-- Avoid the 14 production traps the docs don't warn about (silent `6041 SlippageExceeded`, creator-immutable/admin-mutable metadata, `teamEscrow` per-`mint_main`, etc.)
+- Launch tokens with eyes open: the atomic-launch trace ceiling (`MAX_INSTRUCTION_TRACE_LENGTH = 64`), Jito-bundled creator leverage, composing rise flows via CPI in your own program, and real-time launch detection via `logsSubscribe`
+- Avoid the 19 production traps the docs don't warn about (silent `6041 SlippageExceeded`, creator-immutable/admin-mutable metadata, `teamEscrow` per-`mint_main`, `buyWithExactCashIn` depositing to the wallet ATA not a position, etc.)
 - Reason about the two-program (Rise + Mayflower) architecture and the floor-backed lending invariant that eliminates oracles and liquidations
 
 **Unaffiliated, public good, MIT licensed.** Not endorsed by the rise.rich team.
@@ -53,7 +54,7 @@ This skill **intentionally does not ship** working glue for:
 - "Auto / Max" loop convergence math
 - Priority-fee floor logic or retry-on-blockhash-expiry plumbing
 
-Those are non-trivial engineering — and they're how products built **on top of** rise.rich differentiate themselves. The skill teaches the protocol thoroughly enough that an agent or developer can build them, but doesn't hand them over as a copy-paste recipe. See SKILL.md → "Building loops" for what you'd need to figure out.
+Those are non-trivial engineering — and they're how products built **on top of** rise.rich differentiate themselves. The skill teaches the protocol thoroughly enough that an agent or developer can build them, but doesn't hand them over as a copy-paste recipe. See SKILL.md → "Loop primitives" and "Atomic launch ceiling" for what you'd need to figure out (the constraints and empirical ceilings are documented; the orchestration code is not).
 
 ## Install — Claude Code (skill discovery via frontmatter)
 
@@ -120,7 +121,9 @@ The frontmatter description in `SKILL.md` triggers on language like:
 - "Borrow against my deposited tokens"
 - "Build me a portfolio tracker for rise.rich"
 - "What does `leverageBuy` do?"
-- "Launch a token on rise"
+- "Launch a token on rise" / "Bundle a launch atomically with Jito"
+- "Wrap rise flows in my own Anchor program (CPI)"
+- "Detect new rise launches in real time"
 - "Index rise events"
 
 It does **not** trigger on generic Solana / Anchor / Token-2022 questions — those belong to a Solana smart-contract dev skill.
