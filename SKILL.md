@@ -1,6 +1,6 @@
 ---
 name: rise-rich-protocol
-description: Use when integrating with the rise.rich protocol on Solana — querying markets, buying/selling, borrowing/repaying, unwinding positions, indexing events, launching new tokens, or reasoning about its floor-backed lending model. The canonical agent-facing reference for the protocol; covers both the public integration API (easy lane) and direct Anchor/IDL program calls (advanced lane).
+description: Use when integrating with the rise.rich protocol on Solana — querying markets, buying/selling, borrowing/repaying, unwinding positions, indexing events, launching new tokens (including atomic Jito-bundled creator leverage), composing rise flows via CPI in your own program, detecting new launches in real time, or reasoning about its floor-backed lending model. The canonical agent-facing reference for the protocol; covers both the public integration API (easy lane) and direct Anchor/IDL program calls (advanced lane).
 ---
 
 # rise.rich Protocol
@@ -185,13 +185,18 @@ POST /program/sellToken           body: { wallet, market, tokenIn, minCashOut }
 
 For **atomic** deleverage in a single tx, use Lane 2's `leverageSell` IDL call. The API does not expose it.
 
-### Market list filtering (`GET /markets`)
+### Market list filtering + response schema (`GET /markets`, verified live 2026-07-02)
 
 Sortable by: `created` (default), `marketcap`, `volume24h`, `holders`, `floor`, `price`, `variation`, `near_floor`, `liquidity`. Filterable by: `is_verified`, `creator_fee_min/max`, `mcap_min/max`, `vol24h_min/max`, `locked_min/max`, `created_period: today|yesterday|week|month`. Responses cached server-side for 10s per unique param combination.
 
-Computed fields added per row:
-- `delta_to_floor_percentage` — `((price − floor) / floor) × 100`
-- `locked_supply_percentage` — `(mayflower_total_collateral / mayflower_token_supply) × 100`
+Response shape: `{ ok, count, total, page, limit, totalPages, markets[] }` — the full catalog is paginated (>1,100 markets at probe time), and each row carries `created_at`, so **full protocol history is walkable**. Per-market fields go well beyond the two computed ones the docs advertise:
+
+- **Identity / curation:** `token_name`, `token_symbol`, `token_uri`, `token_image`, `website`, `twitter`, `telegram`, `discord`, `is_verified`
+- **Trust / filter signals:** `creator`, `creator_fee_percent`, `disableSell`, `flags` (the `MarketPermissions` bitfield), `holders_count`, `created_at`, `updated_at`, `total_fees_creator`, `total_fees_creator_withdrawn`
+- **Market data:** `price`, `mayflower_floor`, curve params (`mayflower_m1/m2/b1/b2/x2`), `volume_h24_usd`, `volume_all_time_usd`, `market_cap_usd`, `mayflower_total_debt`, `mayflower_total_collateral`, `mayflower_token_supply`, `next_floor_trigger_price`, `next_raise_available_at`
+- **Computed:** `delta_to_floor_percentage` = `((price − floor) / floor) × 100`; `locked_supply_percentage` = `(mayflower_total_collateral / mayflower_token_supply) × 100`
+
+**NOT in the payload: dutch-auction params (`dutchConfig*`).** Read those on-chain when entry-timing against a boosted launch.
 
 ---
 
@@ -360,6 +365,92 @@ The 3% origination fee is **not hardcoded** on-chain. It's `Gov.borrowFeeMicroBa
 
 ---
 
+## Atomic launch ceiling (initMarket + creator buy + leverage)
+
+`initMarket` is too heavy for one transaction. rise.rich's UI splits a launch into **TX1 (legacy — ALT create + extend) + TX2 (V0 — uses the ALT, carries initMarket + creator buy)**: two wallet popups, ~400ms gap for ALT next-slot warmup. If you build a launcher on top, the binding constraint is **not** CU:
+
+| Constraint | Limit | Notes |
+|---|---:|---|
+| Tx size | 1232 B | Solana packet limit. An ALT compresses each repeated pubkey to a 1-byte index. |
+| CU per tx | 1,400,000 | Rarely the binding limit for launch txs. |
+| **Instruction trace** | **64** | `MAX_INSTRUCTION_TRACE_LENGTH` — the real bottleneck. Counts top-level ixs **plus** every recursive inner CPI. |
+
+`initMarket` alone emits **24 inner CPIs** (measured 2026-07-02: Mayflower + token program + Metaplex metadata + system). A full launch TX2 runs 53–64 trace depending on path, so a single tx with `initMarket` + 2 `leverageBuy` layers sits *exactly* at the cap; a 3rd busts it.
+
+**Atomic ceiling per path** (empirical):
+
+| Path | Atomic loops | Mechanism | Notes |
+|---|---:|---|---|
+| Native spot (SOL or USDC) | 0 | single TX2 | `buyWithExactCashIn` deposits to the **wallet ATA**, not a personal_position (gotcha 16). |
+| Native SOL | 1 | TX2 at trace 64; WSOL prestaged in a small extra legacy tx | No Jito tip. 3 popups. No USDC equivalent — the WSOL wrap ixs don't exist for USDC markets. |
+| Jito bundle | **2** | split initMarket (one tx) from creator-buy + 2×leverage (next tx), bundle both via Jito | TX at loops=3 = 1267 B — over the 1232 packet limit, build-fails pre-broadcast. Ceiling is 2, not 3. |
+| Deeper (loops 3+) | 2 atomic + chunks | bundle + post-bundle chunks | Extra chunks land after the bundle and are **sniper-vulnerable — disclose in UI.** |
+
+Building the launcher itself (ALT juggling, WSOL prestage, bundle assembly, trace budgeting) is orchestration this skill does not ship as working code — same stance as the loop primitives above. What you need to *design* it is here; validate any launcher by decoding a known-good rise.rich launch pair with `getTransaction(sig, { maxSupportedTransactionVersion: 0 })` and diffing top-level ixs, ALT contents, tx size, and `meta.innerInstructions` counts against yours.
+
+---
+
+## Jito bundle integration
+
+Jito's block engine submits 1–5 transactions as one atomic bundle that lands in a single slot, in order. Required for atomic creator launches with loops ≥ 2 (any depth for USDC creator leverage) and for any MEV-resistant multi-tx flow.
+
+**Endpoints**
+
+| Cluster | Block engine URL |
+|---|---|
+| Mainnet | `https://mainnet.block-engine.jito.wtf` |
+| Testnet | `https://testnet.block-engine.jito.wtf` |
+| Devnet | **not supported** — validate plumbing on testnet, integrate end-to-end on mainnet |
+
+**JSON-RPC** (`POST {url}/api/v1/bundles`, direct fetch — no SDK):
+- `sendBundle` — `params: [[base64_tx, ...], { encoding: "base64" }]` → `{ result: "<bundle UUID>" }`
+- `getBundleStatuses` — `params: [["<uuid>"]]` → per-tx sigs, slot, confirmation_status, err
+- `getInflightBundleStatuses` — → `status: Pending | Landed | Failed | Invalid`, `landed_slot`
+- `getTipAccounts` — → live tip-account list (use it; hardcoded lists drift)
+
+**Rules**
+- Max 5 txs per bundle. All land in the same slot or none land.
+- **Tip is per-bundle, not per-tx.** Append `SystemProgram.transfer(tip → tipAccount)` to the **last** tx. Zero-tip bundles are rejected before a UUID is even issued (`must write lock at least one tip account`).
+- Randomize the tip account per bundle from the live `getTipAccounts` list. **Never** put the tip account in an ALT — Jito warns ALT-loaded tip accounts are ineffective.
+- Duplicate transaction message hashes are rejected — vary payload bytes (e.g. a memo) across otherwise-identical txs.
+- Preflight exact signed mainnet bundles through Helius `simulateBundle` when available; public Jito endpoints don't expose bundle simulation.
+
+**Tip floor:** testnet has no auction — 1,000 lamports lands reliably (21/21 across bundle sizes in one measured run). Mainnet clears a real auction; expect a rough **0.001–0.01 SOL** baseline under contention, measure your own floor, then default to ≥ measured × 2.
+
+**Landing latency** (testnet; mainnet similar once the tip clears the auction): p50 ~4s, p95 ~8s, p99 ~10s.
+
+**Polling:** after `sendBundle`, poll all three truth sources — `getBundleStatuses`, `getInflightBundleStatuses`, and `getSignatureStatuses(sigs, { searchTransactionHistory: true })`. Cadence: 2s ×3, then 5s ×6, then declare `unknown_status` (~36s) and surface snapshots for recovery. `getInflightBundleStatuses: Invalid` is **not terminal on its own** — a bundle can show `Invalid` then finalize cleanly; treat it as terminal only after the blockhash expires with no signature landed. Confirm atomicity by checking all bundle txs share the same `landed_slot`.
+
+---
+
+## Composing rise via CPI (third-party programs)
+
+Verified live 2026-07-02. You can wrap rise flows inside your own Anchor program (escrow-executed launches, pooled buys, fee routing) because CPI stack headroom exists — measured from a live launch TX2 via `meta.innerInstructions[].instructions[].stackHeight`:
+
+| Flow | Inner CPIs | Max stackHeight | Wrapped in your program |
+|---|---:|---:|---|
+| `initMarket` | 24 | 3 | max 4 — fits (runtime cap = 5) |
+| `buyWithExactCashIn` | 14 | 3 | max 4 — fits |
+
+Re-measure before designing a wrapper — your wrap adds +1 to every height.
+
+**PDA-as-creator fee routing.** `initMarket` signers are `payer` + `seed` only; there is no separate creator account, and `Market.creator` is set to the payer (verified by decoding a live market account). A PDA can be the payer via `invoke_signed` (it must hold rent lamports) — so **your program's PDA becomes the market's creator and owns its `creatorFeePercent` stream**. Expose `withdrawCreatorFees` (signer = `creator`) as an access-gated passthrough CPI to route fees trustlessly, no custody. CPI callers of `buyWithExactCashIn` must pass the full arg set (the API computes these server-side): `cashIn`, `minTokenOut`, `newShoulderEnd`, `floorIncreaseRatio`, `maxNewFloor`, `maxAreaShrinkageToleranceUnits`, `minLiqRatio`.
+
+---
+
+## Real-time launch detection (no API polling)
+
+Rise emits Anchor instruction-name logs at top-level invoke:
+
+```
+Program RiseZSHaLdj7pfn1tisUoSdG2i3QcVz9sQKuaRG9rar invoke [1]
+Program log: Instruction: InitMarket
+```
+
+Recipe: a websocket `logsSubscribe` (Helius or any RPC) with `{ mentions: [RISE_PROGRAM_ID] }`, `commitment: "confirmed"`; match `Instruction: InitMarket` in `logs[]`; then fetch the tx / market account for detail. Reconnect with jittered backoff and gap-fill missed slots via `getSignaturesForAddress(RISE_PROGRAM_ID, { until: lastSeenSig })`. The same log-name match works for any rise ix. This costs none of the API's 150/min budget — keep a ≤6/min `/markets` poll only as fallback + metadata enrichment.
+
+---
+
 ## Critical gotchas (the ones that bite)
 
 1. **`Custom: 6041 SlippageExceeded` can land but revert silently.** A confirmed tx with `meta.err = { Custom: 6041 }` is finalized but failed. **Always check `meta.err` after `confirmTransaction`** — don't trust signature confirmation alone. This is the #1 source of "wait, my tx succeeded but nothing happened" bugs. Use `confirmAndCheckErr()` from `@rise-rich/skill-helpers`.
@@ -389,6 +480,16 @@ The 3% origination fee is **not hardcoded** on-chain. It's `Gov.borrowFeeMicroBa
 13. **Cross-tx slippage drift.** Slippage is static within a tx (sim covers atomicity) but dynamic between chained txs. **Re-fetch on-chain state and re-plan** between chunks; don't carry stale quotes.
 
 14. **SDK quirks worth knowing.** Public `@riserich/sdk` has no shipped tests or examples. Sell quote uses buy fee (bug above). `leverageBuy` / `leverageSell` are missing from `docs/PROGRAM.md` but exist in the IDL with full account lists and inline docs. **The IDL is truth.**
+
+15. **`MAX_INSTRUCTION_TRACE_LENGTH = 64` is the atomic-launch bottleneck, not CU.** `initMarket` alone eats 24 inner trace (measured 2026-07-02); each `leverageBuy` adds ~13–18. Plan launches around trace, not CU (which has headroom). See "Atomic launch ceiling".
+
+16. **`buyWithExactCashIn` (loops=0 creator buy) deposits to the wallet ATA, NOT a personal_position.** Verifying a spot launch by reading `personalPosition.depositedTokenBalance` reports 0 — correct, not a bug; the position account itself returns `AccountNotFound` for a pure spot buy. Check the wallet token ATA instead, and branch verification on plan kind. `leverageBuy` (loops ≥ 1) deposits to personal_position as expected.
+
+17. **A USDC native-baseline ALT can exceed 1232 B.** rise.rich's UI fits the USDC launch ALT in a single TX1; a naive pubkey set can spill to ~1250 B and get rejected (`base64 encoded too large`). Match their canonical ALT pubkey set rather than splitting into an extra tx — decode a rise.rich USDC launch's ALT and diff.
+
+18. **rise.rich devnet has no real USDC.** SPL stand-in mints fail `InvalidAccountData` at launch even when packet sizes look fine. Validate USDC paths on mainnet (byte-for-byte against a known USDC launch), not devnet.
+
+19. **Atomic creator leverage without Jito is loops=1 SOL / loops=0 USDC.** Anything deeper needs a Jito bundle (ceiling 2) or splits into post-launch chunks that are sniper-vulnerable. Don't market "atomic creator leverage" without disclosing this constraint.
 
 ---
 
@@ -454,4 +555,7 @@ Floor                monotonic stair-step              never drops → no liquid
 Lane choice          web3.js v1 + anchor 0.29          kit/v2 needs Codama regen
 leverageBuy CU       ~190k warm / ~220k cold           ≤ 3 per tx safely
 Cross-tx slippage    static in-tx, dynamic cross-tx    re-fetch state between chunks
+Instruction trace    64 = MAX_TRACE                    atomic-launch bottleneck, not CU
+Atomic launch        1 loop SOL / 0 USDC (no Jito)     deeper needs Jito bundle (ceiling 2)
+Jito bundle          1-5 tx, 1 tip on last tx, 1 slot  poll 3 sources; Invalid not terminal
 ```
