@@ -35,10 +35,25 @@ export interface MarketRow {
   gov_buy_fee_micro_basis_points: number;
   gov_sell_fee_micro_basis_points: number;
   disableSell: boolean;
+  is_verified?: boolean;
+  flags?: number; // MarketPermissions bitfield (admin kill-switches)
+  token_uri?: string;
+  website?: string;
   twitter?: string;
   discord?: string;
   telegram?: string;
+  total_fees_creator?: string;
+  total_fees_creator_withdrawn?: string;
+  // Linear bonding-curve params (verified present in GET /markets, 2026-07-02).
+  mayflower_m1?: string;
+  mayflower_m2?: string;
+  mayflower_b1?: string;
+  mayflower_b2?: string;
+  mayflower_x2?: string;
+  next_floor_trigger_price?: string;
+  next_raise_available_at?: string;
   created_at: string;
+  updated_at?: string;
   delta_to_floor_percentage?: string;
   locked_supply_percentage?: string;
 }
